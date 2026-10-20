@@ -1,0 +1,148 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths: ["images/**", ".github/workflows/build.yml"]
+  pull_request:
+    paths: ["images/**"]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  REGISTRY: ${{ vars.ZOT_REGISTRY }}
+  NAMESPACE: golden
+
+jobs:
+  lint:
+    runs-on: [self-hosted, homelab]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: hadolint
+        run: find images -name Dockerfile -print0 | xargs -0 -n1 hadolint --config .hadolint.yaml
+      - name: gitleaks
+        run: gitleaks detect --source . --no-banner --redact
+
+  build:
+    needs: lint
+    runs-on: [self-hosted, homelab]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: go-builder
+            context: images/go-builder
+            variant: ""
+            smoke: "go version && golangci-lint --version && govulncheck -version"
+          - name: node-builder
+            context: images/node-builder
+            variant: ""
+            smoke: "node -v && corepack --version && git --version"
+          - name: python-base
+            context: images/python-base
+            variant: ""
+            smoke: "python --version && uv --version"
+          - name: github-runner
+            context: images/github-runner
+            variant: ""
+            smoke: "cosign version && trivy --version && syft version && gitleaks version && hadolint --version && buildah --version && skopeo --version"
+          - name: runtime
+            context: images/runtime-distroless
+            variant: go
+            smoke: ""
+          - name: runtime
+            context: images/runtime-distroless
+            variant: node
+            smoke: ""
+          - name: runtime
+            context: images/runtime-distroless
+            variant: python
+            smoke: ""
+    env:
+      NAME: ${{ matrix.name }}
+      CONTEXT: ${{ matrix.context }}
+      VARIANT: ${{ matrix.variant }}
+      SMOKE: ${{ matrix.smoke }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute refs
+        run: |
+          stamp="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          if [ -n "$VARIANT" ]; then
+            primary="${VARIANT}-${stamp}"; moving="$VARIANT"
+          else
+            primary="$stamp"; moving="stable"
+          fi
+          {
+            echo "REPO=${REGISTRY}/${NAMESPACE}/${NAME}"
+            echo "PRIMARY_TAG=${primary}"
+            echo "MOVING_TAG=${moving}"
+            echo "ARCHIVE=${RUNNER_TEMP}/image.tar"
+            echo "SBOM=${RUNNER_TEMP}/sbom.spdx.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          args=()
+          if [ -n "$VARIANT" ]; then args+=(--target "$VARIANT"); fi
+          buildah build --format oci --layers "${args[@]}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --tag "${REPO}:${PRIMARY_TAG}" \
+            "$CONTEXT"
+          buildah tag "${REPO}:${PRIMARY_TAG}" "${REPO}:${MOVING_TAG}"
+
+      - name: Smoke test
+        if: matrix.smoke != ''
+        run: |
+          ctr=$(buildah from "${REPO}:${PRIMARY_TAG}")
+          buildah run "$ctr" -- bash -c "$SMOKE"
+          buildah rm "$ctr"
+
+      - name: Export archive
+        run: buildah push "${REPO}:${PRIMARY_TAG}" "oci-archive:${ARCHIVE}"
+
+      - name: Trivy scan
+        run: trivy image --input "$ARCHIVE" --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+
+      - name: SBOM
+        run: syft scan "oci-archive:${ARCHIVE}" -o "spdx-json=${SBOM}"
+
+      - name: Registry login
+        if: github.event_name != 'pull_request'
+        env:
+          ZOT_USER: ${{ secrets.ZOT_USER }}
+          ZOT_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+        run: printf '%s' "$ZOT_PASSWORD" | buildah login --username "$ZOT_USER" --password-stdin "$REGISTRY"
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        run: |
+          buildah push --digestfile "${RUNNER_TEMP}/digest" "${REPO}:${PRIMARY_TAG}" "docker://${REPO}:${PRIMARY_TAG}"
+          buildah push "${REPO}:${MOVING_TAG}" "docker://${REPO}:${MOVING_TAG}"
+
+      - name: Sign and attest
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          ref="${REPO}@$(cat "${RUNNER_TEMP}/digest")"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY --tlog-upload=false "$ref"
+          cosign attest --yes --key env://COSIGN_PRIVATE_KEY --tlog-upload=false \
+            --type spdxjson --predicate "$SBOM" "$ref"
