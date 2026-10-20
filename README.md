@@ -14,7 +14,7 @@
 
 ## Пайплайн
 
-`.github/workflows/build.yml` запускается на раннере `[self-hosted, homelab]`: сначала hadolint и gitleaks, затем для каждого образа сборка, smoke-тест, Trivy (HIGH/CRITICAL, только исправимые), SBOM, push в Zot, подпись и attestation через cosign. Pull request'ы собирают и сканируют образы, но не пушат. Раз в неделю по расписанию всё пересобирается, чтобы подтянуть исправления базовых образов.
+`.github/workflows/build.yml` запускается на раннере `[self-hosted, homelab]`: сначала hadolint и gitleaks, затем для каждого образа вызывается reusable workflow `image-build.yml` из [ci-templates](https://github.com/as-platform/ci-templates) (`@main`): сборка, smoke-тест, Trivy (HIGH/CRITICAL, только исправимые), SBOM, push в Zot, подпись и attestation через cosign. Pull request'ы собирают и сканируют образы, но не пушат. Раз в неделю по расписанию всё пересобирается, чтобы подтянуть исправления базовых образов.
 
 Необходимые настройки:
 
